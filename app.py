@@ -164,6 +164,7 @@ class ChatScreen(Screen):
                 ListView(id="node-list"),
                 id="sidebar",
             ),
+            id="chat-area",
         )
         yield Container(
             Input(placeholder="Type a message and press Enter to send...", id="msg-input"),
@@ -611,6 +612,9 @@ class MeshtasticTUI(App):
     }
     #device-screen #scan-btn {
         width: 30;
+    }
+    #chat-area {
+        height: 1fr;
     }
     #chat-tabs {
         height: 100%;
