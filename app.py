@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -172,6 +173,10 @@ class ChatScreen(Screen):
         )
         yield Footer()
 
+    @staticmethod
+    def _sanitize_id(raw: str) -> str:
+        return re.sub(r'[^a-zA-Z0-9_-]', '_', raw)
+
     def _write_to_tab(self, tab_id: str, msg: str) -> None:
         self.query_one(f"#log-{tab_id}", RichLog).write(msg)
 
@@ -191,7 +196,9 @@ class ChatScreen(Screen):
             for n in self._interface.nodes.values():
                 user = n.get("user", {})
                 if user.get("id") == node_id:
-                    return user.get("longName", node_id)
+                    short = user.get("shortName", "")
+                    long_name = user.get("longName", node_id)
+                    return f"{short} {long_name}" if short else long_name
         return node_id
 
     def _get_channel_name(self, ch_index: int) -> str:
@@ -384,7 +391,7 @@ class ChatScreen(Screen):
                 star = "★" if nid in self._favorites else " "
                 label = Label(f"{star} {short:<5} {long_name}")
                 item = ListItem(label)
-                item.data = ("node", nid, long_name)
+                item.data = ("node", nid, long_name, short)
                 node_list.append(item)
         except Exception:
             return
@@ -434,11 +441,11 @@ class ChatScreen(Screen):
 
         is_dm = bool(to_id and to_id != "^all")
         if is_dm:
-            tab_id = f"tab-{from_id}"
+            tab_id = self._sanitize_id(f"tab-{from_id}")
             node_name = self._get_node_name(from_id)
             entry.append("[DM] ", "bold magenta")
         else:
-            tab_id = f"tab-ch-{ch}"
+            tab_id = self._sanitize_id(f"tab-ch-{ch}")
             node_name = ""
             if ch != 0:
                 entry.append(f"[ch{ch}] ", "bold yellow")
@@ -464,11 +471,13 @@ class ChatScreen(Screen):
         value = event.item.data[1]
 
         if kind == "channel":
-            tab_id = f"tab-ch-{value}"
+            tab_id = self._sanitize_id(f"tab-ch-{value}")
             title = self._get_channel_name(value)
         elif kind == "node":
-            tab_id = f"tab-{value}"
-            title = event.item.data[2] if len(event.item.data) > 2 else value
+            tab_id = self._sanitize_id(f"tab-{value}")
+            long_name = event.item.data[2] if len(event.item.data) > 2 else value
+            short_name = event.item.data[3] if len(event.item.data) > 3 else ""
+            title = f"{short_name} {long_name}" if short_name else long_name
         else:
             return
 
