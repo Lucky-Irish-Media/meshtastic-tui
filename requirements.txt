@@ -1,0 +1,4 @@
+textual>=2.0.0
+meshtastic>=2.7.0
+bleak>=0.22.0
+rich>=13.0.0
