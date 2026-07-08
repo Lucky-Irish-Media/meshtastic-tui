@@ -131,10 +131,10 @@ class ChatScreen(Screen):
     BINDINGS: ClassVar = [
         Binding("q", "app.quit", "Quit", priority=True),
         Binding("escape", "disconnect", "Disconnect"),
-        Binding("c", "focus_channels", "Channels"),
-        Binding("n", "focus_nodes", "Nodes"),
-        Binding("b", "broadcast", "Broadcast"),
-        Binding("f", "toggle_favorite", "Fav"),
+        Binding("c", "focus_channels", "Channels", priority=True),
+        Binding("n", "focus_nodes", "Nodes", priority=True),
+        Binding("b", "broadcast", "Broadcast", priority=True),
+        Binding("f", "toggle_favorite", "Fav", priority=True),
     ]
 
     def __init__(self, device) -> None:
@@ -229,11 +229,20 @@ class ChatScreen(Screen):
     def _do_connect(self) -> None:
         self._connecting = True
         self.app.call_from_thread(self._start_connect_timer)
+
+        pub.subscribe(self._on_connection_established, "meshtastic.connection.established")
+
         try:
             interface = meshtastic.ble_interface.BLEInterface(
                 address=self._device.address
             )
         except Exception as exc:
+            try:
+                pub.unsubscribe(
+                    self._on_connection_established, "meshtastic.connection.established"
+                )
+            except Exception:
+                pass
             self.app.call_from_thread(self._on_connection_failed, str(exc))
             return
 
@@ -276,6 +285,10 @@ class ChatScreen(Screen):
         self._load_favorites()
         self._populate_channels()
         self._populate_nodes()
+
+    def _on_connection_established(self, interface=None) -> None:
+        self._call_on_main(self._populate_channels)
+        self._call_on_main(self._populate_nodes)
 
     def _on_connection_failed(self, error: str) -> None:
         if self._cleaned_up or not self._connecting:
@@ -559,6 +572,9 @@ class ChatScreen(Screen):
             pub.unsubscribe(self._on_text_msg, "meshtastic.receive.text")
             pub.unsubscribe(self._on_disconnected, "meshtastic.connection.lost")
             pub.unsubscribe(self._on_node_updated, "meshtastic.node.updated")
+            pub.unsubscribe(
+                self._on_connection_established, "meshtastic.connection.established"
+            )
         except Exception:
             pass
         if self._interface:
