@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
+import socket
 import threading
 import time
 from pathlib import Path
 from typing import Any, ClassVar
 
-import meshtastic.ble_interface
-import meshtastic.protobuf.channel_pb2 as channel_pb2
-from pubsub import pub
 from rich.text import Text
-from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, VerticalScroll
@@ -29,9 +27,99 @@ from textual.widgets import (
     TabPane,
 )
 
+from protocol import SOCKET_PATH, Message, recv_msg, send_msg
+
+
+class DaemonDisconnected(Exception):
+    pass
+
+
+class DaemonClient:
+    def __init__(self) -> None:
+        self.sock: socket.socket | None = None
+        self.running = True
+        self.reader_thread: threading.Thread | None = None
+        self.inbox: queue.Queue = queue.Queue()
+        self.connected = False
+        self._connect()
+
+    def _connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(str(SOCKET_PATH))
+        self.connected = True
+        self.reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True
+        )
+        self.reader_thread.start()
+
+    def _reader_loop(self) -> None:
+        while self.running and self.sock:
+            try:
+                msg = recv_msg(self.sock)
+                if msg is None:
+                    break
+                self.inbox.put(msg)
+            except (ConnectionError, OSError):
+                break
+        self.connected = False
+        self.inbox.put(DaemonDisconnected)
+
+    def send(self, msg_type: str, **payload: Any) -> None:
+        if not self.sock or not self.connected:
+            return
+        try:
+            send_msg(self.sock, Message(msg_type, payload))
+        except (ConnectionError, OSError):
+            self.connected = False
+            self.inbox.put(DaemonDisconnected)
+
+    def poll(self) -> Any:
+        try:
+            return self.inbox.get_nowait()
+        except queue.Empty:
+            return None
+
+    def reconnect(self) -> bool:
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+        self.connected = False
+
+        for attempt in range(50):
+            try:
+                self._connect()
+                return True
+            except (ConnectionRefusedError, FileNotFoundError):
+                if self.sock:
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
+                time.sleep(0.1)
+        return False
+
+    def close(self) -> None:
+        self.running = False
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+
+FAVORITES_FILE = Path.home() / ".config" / "meshtastic-tui" / "favorites.json"
+
 
 class DeviceScreen(Screen):
     BINDINGS: ClassVar = [Binding("q", "app.quit", "Quit", priority=True)]
+
+    @property
+    def daemon(self) -> DaemonClient:
+        return self.app.daemon  # type: ignore[attr-defined]
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -44,6 +132,7 @@ class DeviceScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._poll_handle = self.set_interval(0.05, self._poll_daemon)
         self._start_scan()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -58,17 +147,35 @@ class DeviceScreen(Screen):
         btn.disabled = True
         status.update("Scanning for 10 seconds...")
         device_list.clear()
-        self._do_scan()
+        self.daemon.send("scan")
 
-    @work(thread=True)
-    def _do_scan(self) -> None:
-        try:
-            devices = meshtastic.ble_interface.BLEInterface.scan()
-        except Exception as exc:
-            self.app.call_from_thread(self._scan_failed, str(exc))
+    def _stop_polling(self) -> None:
+        if self._poll_handle:
+            self._poll_handle.stop()
+            self._poll_handle = None
+
+    def _poll_daemon(self) -> None:
+        if self.app.screen is not self:
             return
+        while True:
+            msg = self.daemon.poll()
+            if msg is DaemonDisconnected:
+                self._daemon_disconnected()
+                return
+            if msg is None:
+                return
+            self._handle_msg(msg)
 
-        self.app.call_from_thread(self._scan_complete, devices)
+    def _handle_msg(self, msg: Message) -> None:
+        if msg.type == "scan_result":
+            self._scan_complete(msg.payload.get("devices", []))
+        elif msg.type == "error":
+            self._scan_failed(msg.payload.get("message", "Unknown error"))
+        elif msg.type == "connection_established":
+            self._stop_polling()
+            address = msg.payload.get("address", "")
+            name = msg.payload.get("name", address)
+            self.app.push_screen(ChatScreen(address, name))
 
     def _scan_failed(self, error: str) -> None:
         try:
@@ -79,7 +186,7 @@ class DeviceScreen(Screen):
         except Exception:
             pass
 
-    def _scan_complete(self, devices) -> None:
+    def _scan_complete(self, devices: list[dict]) -> None:
         try:
             status = self.query_one("#scan-status", Label)
             btn = self.query_one("#scan-btn", Button)
@@ -96,9 +203,11 @@ class DeviceScreen(Screen):
             return
 
         try:
-            status.update(f"Found {len(devices)} device(s). Select one to connect.")
+            status.update(
+                f"Found {len(devices)} device(s). Select one to connect."
+            )
             for d in devices:
-                item = ListItem(Label(f"{d.name or 'Unknown'}  [{d.address}]"))
+                item = ListItem(Label(f"{d['name']}  [{d['address']}]"))
                 item.data = d
                 device_list.append(item)
             btn.disabled = False
@@ -106,6 +215,7 @@ class DeviceScreen(Screen):
             pass
 
     def on_screen_resume(self) -> None:
+        self._poll_handle = self.set_interval(0.05, self._poll_daemon)
         try:
             device_list = self.query_one("#device-list", ListView)
             status = self.query_one("#scan-status", Label)
@@ -122,10 +232,21 @@ class DeviceScreen(Screen):
         device = event.item.data
         if device is None:
             return
-        self.app.push_screen(ChatScreen(device))
+        address = device.get("address", "")
+        if not address:
+            return
+        self.app.push_screen(ChatScreen(address, device.get("name", "Unknown")))
 
-
-FAVORITES_FILE = Path.home() / ".config" / "meshtastic-tui" / "favorites.json"
+    def _daemon_disconnected(self) -> None:
+        try:
+            status = self.query_one("#scan-status", Label)
+            btn = self.query_one("#scan-btn", Button)
+            status.update("[red]Lost connection to daemon. Retrying...[/]")
+            btn.disabled = True
+        except Exception:
+            pass
+        if self.daemon.reconnect():
+            self._start_scan()
 
 
 class ChatScreen(Screen):
@@ -139,17 +260,22 @@ class ChatScreen(Screen):
         Binding("ctrl+w", "close_tab", "Close Tab", priority=True),
     ]
 
-    def __init__(self, device) -> None:
-        self._device = device
-        self._interface = None
+    @property
+    def daemon(self) -> DaemonClient:
+        return self.app.daemon  # type: ignore[attr-defined]
+
+    def __init__(self, address: str, name: str = "") -> None:
+        self._address = address
+        self._device_name = name
         self._connected = False
         self._cleaned_up = False
-        self._connection_timer = None
-        self._connect_timer = None
-        self._connecting = False
+        self._connection_timer: Any = None
+        self._poll_handle = None
         self._channel_index = 0
-        self._destination_id = None
+        self._destination_id: str | None = None
         self._favorites: set[str] = set()
+        self._mesh_nodes: dict[str, dict] = {}
+        self._channels: dict[int, dict] = {}
         self._tab_targets: dict[str, tuple[str, Any]] = {
             "tab-broadcast": ("broadcast", None),
         }
@@ -169,48 +295,54 @@ class ChatScreen(Screen):
             id="chat-area",
         )
         yield Container(
-            Input(placeholder="Type a message and press Enter to send...", id="msg-input"),
+            Input(
+                placeholder="Type a message and press Enter to send...",
+                id="msg-input",
+            ),
             id="input-container",
         )
         yield Footer()
 
     @staticmethod
     def _sanitize_id(raw: str) -> str:
-        return re.sub(r'[^a-zA-Z0-9_-]', '_', raw)
+        return re.sub(r"[^a-zA-Z0-9_-]", "_", raw)
 
     def _write_to_tab(self, tab_id: str, msg: str) -> None:
         self.query_one(f"#log-{tab_id}", RichLog).write(msg)
 
-    def _get_or_create_tab(self, tab_id: str, title: str, kind: str, value: Any) -> RichLog:
+    def _get_or_create_tab(
+        self, tab_id: str, title: str, kind: str, value: Any
+    ) -> RichLog:
         try:
             return self.query_one(f"#log-{tab_id}", RichLog)
         except Exception:
             tabs = self.query_one("#chat-tabs", TabbedContent)
-            log = RichLog(id=f"log-{tab_id}", highlight=True, markup=True, wrap=True)
+            log = RichLog(
+                id=f"log-{tab_id}", highlight=True, markup=True, wrap=True
+            )
             pane = TabPane(title, log, id=tab_id)
             tabs.add_pane(pane)
             self._tab_targets[tab_id] = (kind, value)
             return log
 
     def _get_node_name(self, node_id: str) -> str:
-        if self._interface and self._interface.nodes:
-            for n in self._interface.nodes.values():
-                user = n.get("user", {})
-                if user.get("id") == node_id:
-                    short = user.get("shortName", "")
-                    long_name = user.get("longName", node_id)
-                    return f"{short} {long_name}" if short else long_name
+        node = self._mesh_nodes.get(node_id)
+        if node:
+            short = node.get("shortName", "")
+            long_name = node.get("longName", node_id)
+            return f"{short} {long_name}" if short else long_name
         return node_id
 
     def _get_channel_name(self, ch_index: int) -> str:
-        if self._interface and self._interface.localNode and self._interface.localNode.channels:
-            for ch in self._interface.localNode.channels:
-                if ch.index == ch_index:
-                    return ch.settings.name or f"Channel {ch_index}"
+        ch = self._channels.get(ch_index)
+        if ch:
+            return ch.get("name", f"Channel {ch_index}")
         return f"Channel {ch_index}"
 
-    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
-        tab_id = event.pane.id
+    def on_tabbed_content_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        tab_id = event.pane.id or "tab-broadcast"
         kind, value = self._tab_targets.get(tab_id, ("broadcast", None))
         if kind == "broadcast":
             self._channel_index = 0
@@ -226,96 +358,85 @@ class ChatScreen(Screen):
         tabs = self.query_one("#chat-tabs", TabbedContent)
         broadcast_pane = TabPane(
             "Broadcast",
-            RichLog(id="log-tab-broadcast", highlight=True, markup=True, wrap=True),
+            RichLog(
+                id="log-tab-broadcast", highlight=True, markup=True, wrap=True
+            ),
             id="tab-broadcast",
         )
         tabs.add_pane(broadcast_pane)
         self._tab_targets["tab-broadcast"] = ("broadcast", None)
         self._write_to_tab("tab-broadcast", "[yellow]Connecting...[/]")
-        self._do_connect()
+        self._poll_handle = self.set_interval(0.05, self._poll_daemon)
+        self.daemon.send("connect", address=self._address)
 
-    @work(thread=True)
-    def _do_connect(self) -> None:
-        self._connecting = True
-        self.app.call_from_thread(self._start_connect_timer)
-
-        pub.subscribe(self._on_connection_established, "meshtastic.connection.established")
-
-        try:
-            interface = meshtastic.ble_interface.BLEInterface(
-                address=self._device.address
-            )
-        except Exception as exc:
-            try:
-                pub.unsubscribe(
-                    self._on_connection_established, "meshtastic.connection.established"
-                )
-            except Exception:
-                pass
-            self.app.call_from_thread(self._on_connection_failed, str(exc))
+    def _poll_daemon(self) -> None:
+        if self.app.screen is not self:
             return
+        while True:
+            msg = self.daemon.poll()
+            if msg is DaemonDisconnected:
+                self._daemon_disconnected()
+                return
+            if msg is None:
+                return
+            self._handle_msg(msg)
 
-        if self._cleaned_up or not self._connecting:
-            self._close_interface(interface)
-            return
-
-        self.app.call_from_thread(self._on_connected, interface)
-
-    @staticmethod
-    def _close_interface(interface) -> None:
+    def _handle_msg(self, msg: Message) -> None:
         try:
-            interface.close()
+            handler = {
+                "connection_established": self._on_connected,
+                "connection_failed": self._on_connection_failed,
+                "connection_lost": self._handle_disconnect,
+                "text_received": self._display_packet,
+                "nodes": self._on_nodes,
+                "channels": self._on_channels,
+                "error": self._on_error,
+            }.get(msg.type)
+            if handler:
+                handler(msg)
         except Exception:
             pass
 
-    def _start_connect_timer(self) -> None:
-        self._connect_timer = self.set_timer(30, self._on_connect_timed_out)
-
-    def _on_connect_timed_out(self) -> None:
-        if self._cleaned_up or not self._connecting:
+    def _on_connected(self, msg: Message) -> None:  # noqa: ARG002
+        if self._cleaned_up:
             return
-        self._on_connection_failed("Connection timed out")
-
-    def _on_connected(self, interface) -> None:
-        if self._cleaned_up or not self._connecting:
-            self._cancel_connect_timer()
-            self._close_interface(interface)
-            return
-        self._cancel_connect_timer()
-        self._connecting = False
-        self._interface = interface
         self._connected = True
         self._write_to_tab("tab-broadcast", "[bold green]Connected![/]")
-
-        pub.subscribe(self._on_text_msg, "meshtastic.receive.text")
-        pub.subscribe(self._on_disconnected, "meshtastic.connection.lost")
-        pub.subscribe(self._on_node_updated, "meshtastic.node.updated")
-
         self._load_favorites()
         self._populate_channels()
         self._populate_nodes()
+        self._update_subtitle()
 
-    def _on_connection_established(self, interface=None) -> None:
-        self._call_on_main(self._populate_channels)
-        self._call_on_main(self._populate_nodes)
-
-    def _on_connection_failed(self, error: str) -> None:
-        if self._cleaned_up or not self._connecting:
-            self._cancel_connect_timer()
+    def _on_connection_failed(self, msg: Message) -> None:
+        if self._cleaned_up:
             return
-        self._cancel_connect_timer()
-        self._connecting = False
-        self._write_to_tab("tab-broadcast", f"[bold red]Connection failed: {error}[/]")
+        error = msg.payload.get("error", "Unknown error")
+        self._write_to_tab(
+            "tab-broadcast", f"[bold red]Connection failed: {error}[/]"
+        )
         self.sub_title = "Disconnected"
         self._connection_timer = self.set_timer(1.5, self.app.pop_screen)
 
-    def _cancel_connect_timer(self) -> None:
-        if self._connect_timer:
-            self._connect_timer.stop()
-            self._connect_timer = None
+    def _on_nodes(self, msg: Message) -> None:
+        self._mesh_nodes = {
+            n["id"]: n for n in msg.payload.get("nodes", [])
+        }
+        self._populate_nodes()
+
+    def _on_channels(self, msg: Message) -> None:
+        self._channels = {
+            ch["index"]: ch for ch in msg.payload.get("channels", [])
+        }
+        self._populate_channels()
+
+    def _on_error(self, msg: Message) -> None:
+        self._write_to_tab(
+            "tab-broadcast",
+            f"[bold red]Error: {msg.payload.get('message', '')}[/]",
+        )
 
     def _update_subtitle(self) -> None:
-        name = self._device.name or self._device.address
+        name = self._device_name or self._address
         if self._destination_id:
             self.sub_title = f"{name}  DM to {self._destination_id}"
         else:
@@ -333,15 +454,13 @@ class ChatScreen(Screen):
     def _save_favorites(self) -> None:
         try:
             FAVORITES_FILE.parent.mkdir(parents=True, exist_ok=True)
-            FAVORITES_FILE.write_text(json.dumps({"favorites": sorted(self._favorites)}, indent=2))
+            FAVORITES_FILE.write_text(
+                json.dumps({"favorites": sorted(self._favorites)}, indent=2)
+            )
         except Exception:
             pass
 
     def _populate_channels(self) -> None:
-        iface = self._interface
-        if not iface or not iface.localNode or not iface.localNode.channels:
-            return
-
         try:
             ch_list = self.query_one("#channel-list", ListView)
         except Exception:
@@ -349,23 +468,18 @@ class ChatScreen(Screen):
         ch_list.clear()
 
         try:
-            for ch in iface.localNode.channels:
-                if ch.role == channel_pb2.Channel.DISABLED:
-                    continue
-                role = "P" if ch.role == channel_pb2.Channel.PRIMARY else "S"
-                name = ch.settings.name or f"CH{ch.index}"
-                label = Label(f"[{role}] {name}  (ch {ch.index})")
+            for ch_idx in sorted(self._channels):
+                ch = self._channels[ch_idx]
+                role = ch.get("role", "S")
+                name = ch.get("name", f"CH{ch_idx}")
+                label = Label(f"[{role}] {name}  (ch {ch_idx})")
                 item = ListItem(label)
-                item.data = ("channel", ch.index)
+                item.data = ("channel", ch_idx)
                 ch_list.append(item)
         except Exception:
-            return
+            pass
 
     def _populate_nodes(self) -> None:
-        iface = self._interface
-        if not iface or not iface.nodes:
-            return
-
         try:
             node_list = self.query_one("#node-list", ListView)
         except Exception:
@@ -374,10 +488,10 @@ class ChatScreen(Screen):
 
         try:
             known = sorted(
-                iface.nodes.values(),
+                self._mesh_nodes.values(),
                 key=lambda n: (
-                    n.get("user", {}).get("id", "") not in self._favorites,
-                    n.get("user", {}).get("longName", ""),
+                    n.get("id", "") not in self._favorites,
+                    n.get("longName", ""),
                 ),
             )
         except Exception:
@@ -385,10 +499,9 @@ class ChatScreen(Screen):
 
         try:
             for node in known:
-                user = node.get("user", {})
-                nid = user.get("id", "?")
-                short = user.get("shortName", "?")
-                long_name = user.get("longName", "?")
+                nid = node.get("id", "?")
+                short = node.get("shortName", "?")
+                long_name = node.get("longName", "?")
                 star = "★" if nid in self._favorites else " "
                 label = Label(f"{star} {short:<5} {long_name}")
                 item = ListItem(label)
@@ -404,30 +517,19 @@ class ChatScreen(Screen):
         except Exception:
             pass
 
-    def _on_text_msg(self, packet, interface) -> None:  # noqa: ARG001
-        self._call_on_main(self._display_packet, packet)
-
-    def _on_node_updated(self, node, interface) -> None:  # noqa: ARG001
-        self._call_on_main(self._populate_nodes)
-
-    def _on_disconnected(self, interface, **kwargs) -> None:  # noqa: ARG001
-        self._call_on_main(self._handle_disconnect, "Device disconnected")
-
-    def _call_on_main(self, callback, *args, **kwargs):
-        try:
-            self.app.call_from_thread(callback, *args, **kwargs)
-        except RuntimeError:
-            callback(*args, **kwargs)
-
-    def _handle_disconnect(self, reason: str) -> None:
+    def _handle_disconnect(self, msg: Message) -> None:
+        if self._cleaned_up:
+            return
         self._connected = False
+        reason = msg.payload.get("reason", "Disconnected")
         self._write_to_tab("tab-broadcast", f"[bold yellow]{reason}[/]")
         self.sub_title = "Disconnected"
 
-    def _display_packet(self, packet: dict) -> None:
+    def _display_packet(self, msg: Message) -> None:
         if not self._connected:
             return
 
+        packet = msg.payload.get("packet", {})
         from_id = packet.get("fromId", "?")
         text = packet.get("decoded", {}).get("text", "")
         rx_snr = packet.get("rxSnr")
@@ -435,7 +537,11 @@ class ChatScreen(Screen):
         ch = packet.get("channel", 0)
         to_id = packet.get("toId", "")
 
-        tm = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else time.strftime("%H:%M:%S")
+        tm = (
+            time.strftime("%H:%M:%S", time.localtime(ts))
+            if ts
+            else time.strftime("%H:%M:%S")
+        )
 
         entry = Text.assemble()
         entry.append(f"{tm} ", "dim")
@@ -476,8 +582,12 @@ class ChatScreen(Screen):
             title = self._get_channel_name(value)
         elif kind == "node":
             tab_id = self._sanitize_id(f"tab-{value}")
-            long_name = event.item.data[2] if len(event.item.data) > 2 else value
-            short_name = event.item.data[3] if len(event.item.data) > 3 else ""
+            long_name = (
+                event.item.data[2] if len(event.item.data) > 2 else value
+            )
+            short_name = (
+                event.item.data[3] if len(event.item.data) > 3 else ""
+            )
             title = f"{short_name} {long_name}" if short_name else long_name
         else:
             return
@@ -495,18 +605,15 @@ class ChatScreen(Screen):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
-        if not text or not self._connected or self._interface is None:
+        if not text or not self._connected:
             return
 
-        try:
-            self._interface.sendText(
-                text,
-                destinationId=self._destination_id or "^all",
-                channelIndex=self._channel_index,
-            )
-        except Exception as exc:
-            self._write_to_tab("tab-broadcast", f"[bold red]Send failed: {exc}[/]")
-            return
+        self.daemon.send(
+            "send_text",
+            text=text,
+            destinationId=self._destination_id or "^all",
+            channelIndex=self._channel_index,
+        )
 
         tabs = self.query_one("#chat-tabs", TabbedContent)
         active_id = tabs.active
@@ -514,9 +621,13 @@ class ChatScreen(Screen):
         entry = Text.assemble()
         entry.append(f"{tm} ", "dim")
         if self._destination_id:
-            entry.append(f"[Me -> {self._destination_id}] ", "bold green")
+            entry.append(
+                f"[Me -> {self._destination_id}] ", "bold green"
+            )
         else:
-            entry.append(f"[Me (ch{self._channel_index})] ", "bold green")
+            entry.append(
+                f"[Me (ch{self._channel_index})] ", "bold green"
+            )
         entry.append(text)
         if active_id:
             try:
@@ -579,39 +690,52 @@ class ChatScreen(Screen):
         self._cleanup()
         self.app.pop_screen()
 
-    def _cleanup(self) -> None:
+    def _daemon_disconnected(self) -> None:
+        self._write_to_tab(
+            "tab-broadcast",
+            "[bold yellow]Lost connection to daemon. Retrying...[/]",
+        )
+        if self.daemon.reconnect():
+            self._write_to_tab(
+                "tab-broadcast",
+                "[bold green]Reconnected to daemon.[/]",
+            )
+            self.daemon.send("connect", address=self._address)
+
+    def _cleanup(self, send_disconnect: bool = True) -> None:
         if self._cleaned_up:
             return
         self._cleaned_up = True
-        self._cancel_connect_timer()
         if self._connection_timer:
             self._connection_timer.stop()
             self._connection_timer = None
-        try:
-            pub.unsubscribe(self._on_text_msg, "meshtastic.receive.text")
-            pub.unsubscribe(self._on_disconnected, "meshtastic.connection.lost")
-            pub.unsubscribe(self._on_node_updated, "meshtastic.node.updated")
-            pub.unsubscribe(
-                self._on_connection_established, "meshtastic.connection.established"
-            )
-        except Exception:
-            pass
-        if self._interface:
-            iface = self._interface
-            self._interface = None
-            self._connected = False
-            t = threading.Thread(target=iface.close, daemon=True)
-            t.start()
-            t.join(timeout=5)
+        if send_disconnect:
+            self.daemon.send("disconnect")
+        self._connected = False
 
     def on_unmount(self) -> None:
-        self._cleanup()
+        if self._poll_handle:
+            self._poll_handle.stop()
+            self._poll_handle = None
+        self._cleanup(send_disconnect=False)
 
 
 class MeshtasticTUI(App):
     TITLE = "Meshtastic TUI"
     SUB_TITLE = "BLE Chat"
     SCREENS: ClassVar = {"device": DeviceScreen}
+
+    def __init__(self, daemon: DaemonClient) -> None:
+        self.daemon = daemon
+        super().__init__()
+
+    @property
+    def daemon(self) -> DaemonClient:
+        return self._daemon
+
+    @daemon.setter
+    def daemon(self, value: DaemonClient) -> None:
+        self._daemon = value
 
     CSS = """
     #device-screen {
@@ -677,10 +801,6 @@ class MeshtasticTUI(App):
         self.push_screen("device")
 
 
-def main():
-    app = MeshtasticTUI()
+def main(daemon: DaemonClient) -> None:
+    app = MeshtasticTUI(daemon)
     app.run()
-
-
-if __name__ == "__main__":
-    main()
