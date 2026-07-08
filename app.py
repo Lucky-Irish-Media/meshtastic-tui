@@ -617,6 +617,7 @@ class MeshtasticTUI(App):
         height: 1fr;
     }
     #chat-tabs {
+        width: 1fr;
         height: 100%;
         border: solid $primary;
     }
