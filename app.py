@@ -136,6 +136,7 @@ class ChatScreen(Screen):
         Binding("n", "focus_nodes", "Nodes", priority=True),
         Binding("b", "broadcast", "Broadcast", priority=True),
         Binding("f", "toggle_favorite", "Fav", priority=True),
+        Binding("ctrl+w", "close_tab", "Close Tab", priority=True),
     ]
 
     def __init__(self, device) -> None:
@@ -547,6 +548,14 @@ class ChatScreen(Screen):
             self.query_one("#msg-input", Input).focus()
         except Exception:
             pass
+
+    def action_close_tab(self) -> None:
+        tabs = self.query_one("#chat-tabs", TabbedContent)
+        active_id = tabs.active
+        if not active_id or active_id == "tab-broadcast":
+            return
+        tabs.remove_pane(active_id)
+        self._tab_targets.pop(active_id, None)
 
     def action_toggle_favorite(self) -> None:
         try:
