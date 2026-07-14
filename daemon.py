@@ -254,20 +254,34 @@ class Daemon:
     def _cmd_scan(self, msg: Message) -> None:  # noqa: ARG002
         def scan_worker() -> None:
             try:
-                devices = meshtastic.ble_interface.BLEInterface.scan()
+                with meshtastic.ble_interface.BLEClient() as client:
+                    response = client.discover(
+                        timeout=10,
+                        return_adv=True,
+                        service_uuids=[
+                            meshtastic.ble_interface.SERVICE_UUID
+                        ],
+                    )
+                from bleak.backends.scanner import AdvertisementData
+
+                results = []
+                for address, (device, adv) in response.items():
+                    if isinstance(adv, AdvertisementData):
+                        rssi = adv.rssi
+                    else:
+                        rssi = None
+                    results.append(
+                        {
+                            "name": device.name or "Unknown",
+                            "address": device.address,
+                            "rssi": rssi,
+                        }
+                    )
             except Exception as exc:
                 self.event_queue.put(
                     Message("scan_result", {"devices": [], "error": str(exc)})
                 )
                 return
-            results = [
-                {
-                    "name": d.name or "Unknown",
-                    "address": d.address,
-                    "rssi": getattr(d, "rssi", None),
-                }
-                for d in devices
-            ]
             self.event_queue.put(
                 Message("scan_result", {"devices": results})
             )
