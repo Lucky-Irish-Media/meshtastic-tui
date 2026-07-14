@@ -10,6 +10,11 @@ A terminal-based chat client for Meshtastic devices over BLE, built with [Textua
 - Favorite nodes — starred nodes sort to the top of the node list
 - Key bindings for quick navigation
 - **Background daemon** — the BLE connection runs in a separate process and stays alive even if the TUI restarts
+- **System tray icon** — the daemon shows a tray icon indicating connection status, with options to connect/disconnect or quit
+- **Automatic reconnection** — if the BLE connection drops, the daemon retries up to 5 times with exponential backoff
+- **Message history** — the daemon caches up to 500 recent messages and replays them when the TUI reconnects
+- **Signal strength display** — the device scan shows RSSI bars and dBm values for each device
+- **Node details** — the sidebar shows battery level, SNR, and hop count for each node
 
 ## Requirements
 
@@ -77,7 +82,8 @@ They communicate using newline-delimited JSON over a Unix domain socket at `~/.c
 
 ## Configuration
 
-Favorites are persisted to `~/.config/meshtastic-tui/favorites.json`.
+- Favorites are persisted to `~/.config/meshtastic-tui/favorites.json`.
+- Daemon logs are written to `~/.config/meshtastic-tui/daemon.log`.
 
 ## Disclaimer
 
