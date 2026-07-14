@@ -207,7 +207,22 @@ class DeviceScreen(Screen):
                 f"Found {len(devices)} device(s). Select one to connect."
             )
             for d in devices:
-                item = ListItem(Label(f"{d['name']}  [{d['address']}]"))
+                rssi = d.get("rssi")
+                if rssi is not None:
+                    if rssi >= -50:
+                        bars = "▂▄▆█"
+                    elif rssi >= -65:
+                        bars = "▂▄▆░"
+                    elif rssi >= -80:
+                        bars = "▂▄░░"
+                    else:
+                        bars = "▂░░░"
+                    label = Label(
+                        f"{d['name']}  [{d['address']}]  {bars} {rssi} dBm"
+                    )
+                else:
+                    label = Label(f"{d['name']}  [{d['address']}]")
+                item = ListItem(label)
                 item.data = d
                 device_list.append(item)
             btn.disabled = False
@@ -387,6 +402,7 @@ class ChatScreen(Screen):
                 "connection_established": self._on_connected,
                 "connection_failed": self._on_connection_failed,
                 "connection_lost": self._handle_disconnect,
+                "reconnecting": self._on_reconnecting,
                 "text_received": self._display_packet,
                 "history": self._on_history,
                 "nodes": self._on_nodes,
@@ -417,6 +433,17 @@ class ChatScreen(Screen):
         )
         self.sub_title = "Disconnected"
         self._connection_timer = self.set_timer(1.5, self.app.pop_screen)
+
+    def _on_reconnecting(self, msg: Message) -> None:
+        if self._cleaned_up:
+            return
+        attempt = msg.payload.get("attempt", 0)
+        max_attempts = msg.payload.get("max", 5)
+        self.sub_title = f"Reconnecting ({attempt}/{max_attempts})..."
+        self._write_to_tab(
+            "tab-broadcast",
+            f"[dim]Reconnecting... (attempt {attempt}/{max_attempts})[/]",
+        )
 
     def _on_nodes(self, msg: Message) -> None:
         self._mesh_nodes = {
@@ -752,7 +779,7 @@ class MeshtasticTUI(App):
         text-align: center;
     }
     #device-screen ListView {
-        width: 60;
+        width: 72;
         height: 12;
         margin-bottom: 1;
         border: solid $primary;

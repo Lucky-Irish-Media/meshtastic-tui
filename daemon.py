@@ -57,6 +57,10 @@ class Daemon:
         self.cached_channels: list[dict] = []
         self.cached_messages: list[dict] = []
         self.max_cached_messages = 500
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 5
+        self._reconnect_delay = 1.0
+        self._reconnect_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self.sock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,7 +261,11 @@ class Daemon:
                 )
                 return
             results = [
-                {"name": d.name or "Unknown", "address": d.address}
+                {
+                    "name": d.name or "Unknown",
+                    "address": d.address,
+                    "rssi": getattr(d, "rssi", None),
+                }
                 for d in devices
             ]
             self.event_queue.put(
@@ -282,6 +290,8 @@ class Daemon:
             self._close_interface()
 
         self.current_address = address
+        self._reconnect_attempts = 0
+        self._reconnect_delay = 1.0
 
         def connect_worker() -> None:
             pub.subscribe(
@@ -371,9 +381,105 @@ class Daemon:
 
     def _on_disconnected(self, interface, **kwargs) -> None:  # noqa: ARG002
         self.connected = False
-        self._close_interface()
+        self.interface = None
+        self._unsubscribe_all()
+        if self.current_address and self._reconnect_attempts < self._max_reconnect_attempts:
+            self._reconnect_attempts += 1
+            self.event_queue.put(
+                Message(
+                    "reconnecting",
+                    {
+                        "attempt": self._reconnect_attempts,
+                        "max": self._max_reconnect_attempts,
+                    },
+                )
+            )
+            self._reconnect_thread = threading.Thread(
+                target=self._attempt_reconnect, daemon=True
+            )
+            self._reconnect_thread.start()
+        else:
+            self.event_queue.put(
+                Message("connection_lost", {"reason": "Device disconnected"})
+            )
+
+    def _attempt_reconnect(self) -> None:
+        address = self.current_address
+        if not address:
+            return
+
+        delay = self._reconnect_delay
+        for attempt in range(self._reconnect_attempts, self._max_reconnect_attempts):
+            if not self.running or not self.current_address:
+                return
+            _log(f"Reconnect attempt {attempt + 1}/{self._max_reconnect_attempts}, waiting {delay}s")
+            time.sleep(delay)
+            if not self.running or not self.current_address:
+                return
+
+            self._reconnect_attempts = attempt + 1
+            self.event_queue.put(
+                Message(
+                    "reconnecting",
+                    {
+                        "attempt": self._reconnect_attempts,
+                        "max": self._max_reconnect_attempts,
+                    },
+                )
+            )
+
+            try:
+                pub.subscribe(
+                    self._on_connection_established,
+                    "meshtastic.connection.established",
+                )
+                pub.subscribe(
+                    self._on_node_updated,
+                    "meshtastic.node.updated",
+                )
+                pub.subscribe(
+                    self._on_text_msg,
+                    "meshtastic.receive.text",
+                )
+                pub.subscribe(
+                    self._on_disconnected,
+                    "meshtastic.connection.lost",
+                )
+
+                interface = meshtastic.ble_interface.BLEInterface(
+                    address=address
+                )
+            except Exception as exc:
+                _log(f"Reconnect attempt {attempt + 1} failed: {exc}")
+                self._unsubscribe_all()
+                delay = min(delay * 2, 30.0)
+                continue
+
+            self.interface = interface
+            self.connected = True
+            self.current_name = getattr(interface, "name", "") or ""
+            self._reconnect_attempts = 0
+            self._reconnect_delay = 1.0
+            self._cache_channels()
+            self._cache_nodes()
+            self.event_queue.put(
+                Message("channels", {"channels": self.cached_channels})
+            )
+            self.event_queue.put(
+                Message("nodes", {"nodes": self.cached_nodes})
+            )
+            self.event_queue.put(
+                Message(
+                    "connection_established", {"address": address}
+                )
+            )
+            return
+
         self.event_queue.put(
-            Message("connection_lost", {"reason": "Device disconnected"})
+            Message(
+                "connection_lost",
+                {"reason": "Reconnection failed after maximum attempts"},
+            )
         )
 
     def _on_node_updated(self, node, interface) -> None:  # noqa: ARG002
@@ -422,6 +528,7 @@ class Daemon:
         self.cached_nodes = nodes
 
     def _cmd_disconnect(self, msg: Message) -> None:  # noqa: ARG002
+        self._reconnect_attempts = self._max_reconnect_attempts
         self._close_interface()
         self.event_queue.put(
             Message("connection_lost", {"reason": "Disconnected by user"})
