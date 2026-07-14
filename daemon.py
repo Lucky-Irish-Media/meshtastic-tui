@@ -11,6 +11,8 @@ from pathlib import Path
 
 import meshtastic.ble_interface
 import meshtastic.protobuf.channel_pb2 as channel_pb2
+import pystray
+from PIL import Image, ImageDraw
 from pubsub import pub
 
 from protocol import Message, SOCKET_PATH, send_msg
@@ -61,6 +63,7 @@ class Daemon:
         self._max_reconnect_attempts = 5
         self._reconnect_delay = 1.0
         self._reconnect_thread: threading.Thread | None = None
+        self._tray_icon: pystray.Icon | None = None
 
     def start(self) -> None:
         self.sock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,6 +77,9 @@ class Daemon:
 
         worker = threading.Thread(target=self._worker_loop, daemon=True)
         worker.start()
+
+        tray = threading.Thread(target=self._run_tray, daemon=True)
+        tray.start()
 
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -199,6 +205,12 @@ class Daemon:
             self.client_sock = None
 
     def _shutdown(self) -> None:
+        if self._tray_icon:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
         self._close_interface()
         self._close_client()
         if self.server_sock:
@@ -336,6 +348,7 @@ class Daemon:
                         "connection_failed", {"error": f"Connection failed: {exc}"}
                     )
                 )
+                self._update_tray_icon()
                 return
 
             self.interface = interface
@@ -343,6 +356,7 @@ class Daemon:
             self.current_name = getattr(interface, "name", "") or ""
             self._cache_channels()
             self._cache_nodes()
+            self._update_tray_icon()
             self.event_queue.put(
                 Message("channels", {"channels": self.cached_channels})
             )
@@ -381,6 +395,7 @@ class Daemon:
             self.event_queue.put(
                 Message("nodes", {"nodes": self.cached_nodes})
             )
+            self._update_tray_icon()
 
     def _on_text_msg(self, packet, interface) -> None:  # noqa: ARG002
         if isinstance(packet, dict):
@@ -397,6 +412,7 @@ class Daemon:
         self.connected = False
         self.interface = None
         self._unsubscribe_all()
+        self._update_tray_icon()
         if self.current_address and self._reconnect_attempts < self._max_reconnect_attempts:
             self._reconnect_attempts += 1
             self.event_queue.put(
@@ -529,11 +545,15 @@ class Daemon:
         try:
             for node in iface.nodes.values():
                 user = node.get("user", {})
+                metrics = node.get("deviceMetrics", {})
                 nodes.append(
                     {
                         "id": user.get("id", "?"),
                         "shortName": user.get("shortName", "?"),
                         "longName": user.get("longName", "?"),
+                        "batteryLevel": metrics.get("batteryLevel"),
+                        "snr": node.get("snr"),
+                        "hopsAway": node.get("hopsAway"),
                     }
                 )
             nodes.sort(key=lambda n: (n["longName"] or ""))
@@ -547,6 +567,7 @@ class Daemon:
         self.event_queue.put(
             Message("connection_lost", {"reason": "Disconnected by user"})
         )
+        self._update_tray_icon()
 
     def _cmd_send_text(self, msg: Message) -> None:
         if not self.interface or not self.connected:
@@ -579,6 +600,74 @@ class Daemon:
 
     def _cmd_shutdown(self, msg: Message) -> None:  # noqa: ARG002
         self.running = False
+
+    # -- tray icon --------------------------------------------------------
+
+    def _make_icon(self, connected: bool) -> Image.Image:
+        size = 64
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        bg = (72, 187, 120) if connected else (128, 128, 128)
+        draw.ellipse([4, 4, size - 4, size - 4], fill=bg)
+        fg = (255, 255, 255)
+        cx, cy = size // 2, size // 2
+        if connected:
+            for r, w in [(8, 3), (14, 3), (20, 3)]:
+                draw.arc(
+                    [cx - r, cy - r - 4, cx + r, cy + r - 4],
+                    220, 320, fill=fg, width=w,
+                )
+        else:
+            draw.line([cx - 10, cy, cx + 10, cy], fill=fg, width=3)
+        return img
+
+    def _build_menu(self) -> pystray.Menu:
+        if self.connected:
+            label = f"Connected to {self.current_name or self.current_address}"
+            toggle_label = "Disconnect"
+        else:
+            label = "Disconnected"
+            toggle_label = "Connect"
+
+        items = [
+            pystray.MenuItem(label, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(toggle_label, self._tray_toggle_connect),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self._tray_quit),
+        ]
+        return pystray.Menu(*items)
+
+    def _tray_toggle_connect(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # noqa: ARG002
+        if self.connected:
+            msg = Message("disconnect")
+            self.cmd_queue.put(msg)
+        elif self.current_address:
+            msg = Message("connect", {"address": self.current_address})
+            self.cmd_queue.put(msg)
+
+    def _tray_quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # noqa: ARG002
+        icon.stop()
+        self.running = False
+
+    def _update_tray_icon(self) -> None:
+        if not self._tray_icon:
+            return
+        self._tray_icon.icon = self._make_icon(self.connected)
+        self._tray_icon.menu = self._build_menu()
+
+    def _run_tray(self) -> None:
+        try:
+            self._tray_icon = pystray.Icon(
+                "meshtastic",
+                self._make_icon(False),
+                "Meshtastic Daemon",
+                self._build_menu(),
+            )
+            self._tray_icon.run()
+        except Exception as exc:
+            _log(f"Tray icon unavailable: {exc}")
+            self._tray_icon = None
 
 
 def main() -> None:

@@ -534,8 +534,18 @@ class ChatScreen(Screen):
                 nid = node.get("id", "?")
                 short = node.get("shortName", "?")
                 long_name = node.get("longName", "?")
+                battery = node.get("batteryLevel")
+                snr = node.get("snr")
+                hops = node.get("hopsAway")
                 star = "★" if nid in self._favorites else " "
-                label = Label(f"{star} {short:<5} {long_name}")
+                parts = [f"{star} {short:<5} {long_name}"]
+                if battery is not None:
+                    parts.append(f"  {battery}%")
+                if snr is not None:
+                    parts.append(f"  {snr:.1f}dB")
+                if hops is not None:
+                    parts.append(f"  {hops}h")
+                label = Label("".join(parts))
                 item = ListItem(label)
                 item.data = ("node", nid, long_name, short)
                 node_list.append(item)
@@ -796,7 +806,7 @@ class MeshtasticTUI(App):
         border: solid $primary;
     }
     #sidebar {
-        width: 30;
+        width: 45;
         height: 100%;
         border: solid $primary;
         margin-left: 1;
