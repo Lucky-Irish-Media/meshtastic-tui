@@ -388,6 +388,7 @@ class ChatScreen(Screen):
                 "connection_failed": self._on_connection_failed,
                 "connection_lost": self._handle_disconnect,
                 "text_received": self._display_packet,
+                "history": self._on_history,
                 "nodes": self._on_nodes,
                 "channels": self._on_channels,
                 "error": self._on_error,
@@ -434,6 +435,10 @@ class ChatScreen(Screen):
             "tab-broadcast",
             f"[bold red]Error: {msg.payload.get('message', '')}[/]",
         )
+
+    def _on_history(self, msg: Message) -> None:
+        for packet in msg.payload.get("messages", []):
+            self._display_packet(Message("text_received", {"packet": packet}))
 
     def _update_subtitle(self) -> None:
         name = self._device_name or self._address

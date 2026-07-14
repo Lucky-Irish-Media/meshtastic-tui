@@ -26,6 +26,20 @@ def _log(msg: str) -> None:
         pass
 
 
+def _make_json_safe(val: object) -> object:
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace")
+    if isinstance(val, (int, float, str, bool)):
+        return val
+    if val is None:
+        return None
+    if isinstance(val, dict):
+        return {k: _make_json_safe(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [_make_json_safe(v) for v in val]
+    return str(val)
+
+
 class Daemon:
     def __init__(self) -> None:
         self.cmd_queue: queue.Queue[Message] = queue.Queue()
@@ -41,6 +55,8 @@ class Daemon:
         self.current_name: str = ""
         self.cached_nodes: list[dict] = []
         self.cached_channels: list[dict] = []
+        self.cached_messages: list[dict] = []
+        self.max_cached_messages = 500
 
     def start(self) -> None:
         self.sock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,6 +96,7 @@ class Daemon:
 
     def _on_client_connect(self, conn: socket.socket) -> None:
         self._close_client()
+        self._clear_event_queue()
         self.client_sock = conn
         self.reader_thread = threading.Thread(
             target=self._client_reader, daemon=True
@@ -136,6 +153,14 @@ class Daemon:
                     self.client_sock,
                     Message("channels", {"channels": self.cached_channels}),
                 )
+                if self.cached_messages:
+                    send_msg(
+                        self.client_sock,
+                        Message(
+                            "history",
+                            {"messages": self.cached_messages},
+                        ),
+                    )
             except Exception as exc:
                 _log(f"_send_state error: {exc}")
                 self._close_client()
@@ -151,6 +176,13 @@ class Daemon:
                 except (BrokenPipeError, ConnectionError):
                     self._close_client()
                     return
+            except queue.Empty:
+                break
+
+    def _clear_event_queue(self) -> None:
+        while self.running:
+            try:
+                self.event_queue.get_nowait()
             except queue.Empty:
                 break
 
@@ -327,9 +359,15 @@ class Daemon:
             )
 
     def _on_text_msg(self, packet, interface) -> None:  # noqa: ARG002
+        if isinstance(packet, dict):
+            packet.pop("raw", None)
+        safe_packet = _make_json_safe(packet)
         self.event_queue.put(
-            Message("text_received", {"packet": packet})
+            Message("text_received", {"packet": safe_packet})
         )
+        self.cached_messages.append(safe_packet)
+        if len(self.cached_messages) > self.max_cached_messages:
+            self.cached_messages = self.cached_messages[-self.max_cached_messages:]
 
     def _on_disconnected(self, interface, **kwargs) -> None:  # noqa: ARG002
         self.connected = False
