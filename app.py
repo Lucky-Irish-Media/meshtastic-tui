@@ -12,7 +12,7 @@ from typing import Any, ClassVar
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import (
     Button,
@@ -273,6 +273,7 @@ class ChatScreen(Screen):
         Binding("b", "broadcast", "Broadcast", priority=True),
         Binding("f", "toggle_favorite", "Fav", priority=True),
         Binding("ctrl+w", "close_tab", "Close Tab", priority=True),
+        Binding("s", "toggle_sidebar", "Sidebar", priority=True),
     ]
 
     @property
@@ -288,6 +289,7 @@ class ChatScreen(Screen):
         self._poll_handle = None
         self._channel_index = 0
         self._destination_id: str | None = None
+        self._sidebar_visible = True
         self._favorites: set[str] = set()
         self._mesh_nodes: dict[str, dict] = {}
         self._channels: dict[int, dict] = {}
@@ -702,6 +704,11 @@ class ChatScreen(Screen):
         except Exception:
             pass
 
+    def action_toggle_sidebar(self) -> None:
+        self._sidebar_visible = not self._sidebar_visible
+        sidebar = self.query_one("#sidebar")
+        sidebar.set_class(not self._sidebar_visible, "collapsed")
+
     def action_close_tab(self) -> None:
         tabs = self.query_one("#chat-tabs", TabbedContent)
         active_id = tabs.active
@@ -811,6 +818,14 @@ class MeshtasticTUI(App):
         border: solid $primary;
         margin-left: 1;
         overflow-y: auto;
+    }
+    #sidebar.collapsed {
+        width: 0;
+        height: 100%;
+        border: none;
+        margin-left: 0;
+        overflow: hidden;
+        padding: 0;
     }
     #sidebar .sidebar-header {
         text-style: bold;

@@ -62,6 +62,7 @@ Use `--daemonize` if you want the daemon to keep the BLE connection alive betwee
 | `n`       | Focus nodes list           |
 | `b`       | Switch to Broadcast tab    |
 | `f`       | Toggle favorite on node    |
+| `s`       | Toggle sidebar             |
 | `Ctrl+W`  | Close current tab          |
 | `Enter`   | Send message (in input)    |
 
