@@ -21,6 +21,7 @@ A terminal-based chat client for Meshtastic devices over BLE, built with [Textua
 - Python 3.11+
 - A Meshtastic device with BLE support
 - Bluetooth adapter on the host machine (Linux, macOS, or Windows)
+- `pystray` and `Pillow` for the system tray icon (Linux may also need a tray-capable desktop environment)
 
 ## Installation
 
@@ -63,7 +64,6 @@ Use `--daemonize` if you want the daemon to keep the BLE connection alive betwee
 | `f`       | Toggle favorite on node    |
 | `Ctrl+W`  | Close current tab          |
 | `Enter`   | Send message (in input)    |
-| `Tab`     | Cycle between tabs         |
 
 ### Sidebar Interaction
 
@@ -77,6 +77,7 @@ The application is split into two processes:
 
 - **`daemon.py`** (background) — Maintains the BLE connection to the Meshtastic device, subscribes to events, and relays them over a Unix socket.
 - **`app.py`** (TUI) — The Textual-based terminal interface. Connects to the daemon over the Unix socket.
+- **`protocol.py`** (shared) — Defines the `Message` dataclass and JSON socket protocol used by both processes.
 
 They communicate using newline-delimited JSON over a Unix domain socket at `~/.config/meshtastic-tui/meshtasticd.sock`.
 
